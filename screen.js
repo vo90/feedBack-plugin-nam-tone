@@ -1452,39 +1452,160 @@ function _namUpdateSettingsPresetTestControls() {
     _namUpdateSettingsPresetTestStatus();
 }
 
-async function _namPopulateSettingsPresetSelector(presets = null) {
+// The settings selector is presentation only. Keep the chosen option when
+// hidden, without retaining a DOM option for every song-specific rig preset.
+// One owner also retires listeners from a previous evaluation of this script.
+const _namSettingsPresetSelectorLifecycle = {
+    controller: null,
+    dispose() {
+        this.controller?.dispose();
+        this.controller = null;
+    },
+};
+window._namSettingsPresetSelectorLifecycle?.dispose();
+window._namSettingsPresetSelectorLifecycle = _namSettingsPresetSelectorLifecycle;
+
+function _namEnsureSettingsPresetSelector() {
+    if (window._namSettingsPresetSelectorLifecycle !== _namSettingsPresetSelectorLifecycle) return null;
     const section = document.getElementById('nam-settings-preset-test-section');
     const select = document.getElementById('nam-settings-preset-select');
-    if (!section || !select) return;
+    const existing = _namSettingsPresetSelectorLifecycle.controller;
+    if (existing && !existing.disposed && existing.select === select) return existing;
+    _namSettingsPresetSelectorLifecycle.dispose();
+    if (!section || !select) return null;
+    const settings = section.closest('#settings');
+    const panel = section.closest('.fb-tabpanel');
+    const details = section.closest('details');
+    let disposed = false, loaded = false, generation = 0, pending = null, abort = null;
 
-    try {
-        if (!presets) {
-            const resp = await fetch('/api/plugins/nam_tone/presets');
-            presets = await resp.json();
-        }
-        presets = Array.isArray(presets) ? presets : [];
-        section.classList.toggle('hidden', presets.length === 0);
-        if (presets.length === 0) {
-            select.innerHTML = '<option value="">No presets</option>';
-            _namSettingsPresetTestId = '';
-            _namUpdateSettingsPresetTestControls();
-            return;
-        }
-
-        const current = _namSettingsPresetTestId || select.value || (_namDefaultPresetId || '');
-        const selected = presets.some(p => String(p.id) === String(current))
-            ? String(current)
-            : String(presets[0].id);
-        select.innerHTML = presets
-            .map(p => `<option value="${p.id}" ${String(p.id) === selected ? 'selected' : ''}>${esc(p.name)}</option>`)
-            .join('');
-        select.value = selected;
-        _namSettingsPresetTestId = selected;
-        _namUpdateSettingsPresetTestControls();
-    } catch (e) {
-        console.warn('[NAM] Settings preset selector populate failed:', e);
-        section.classList.add('hidden');
+    function visible() {
+        return select.isConnected && !!settings?.classList.contains('active')
+            && (!panel || panel.classList.contains('active'))
+            && (!details || details.open);
     }
+
+    function cancel() {
+        generation++;
+        abort?.abort();
+        abort = null;
+        pending = null;
+    }
+
+    function evict() {
+        cancel();
+        loaded = false;
+        const chosen = select.selectedOptions[0];
+        if (chosen) {
+            _namSettingsPresetTestId = select.value;
+            if (select.options.length > 1) {
+                select.replaceChildren(chosen);
+                select.value = _namSettingsPresetTestId;
+            }
+        } else if (select.options.length) {
+            select.replaceChildren();
+        }
+    }
+
+    function populate(presets = null, refresh = true) {
+        if (disposed) return Promise.resolve();
+        if (!visible()) {
+            evict();
+            return Promise.resolve();
+        }
+        if (presets != null) {
+            cancel();
+            try {
+                _namRenderSettingsPresetSelector(presets, section, select);
+                loaded = true;
+            } catch (e) {
+                console.warn('[NAM] Settings preset selector populate failed:', e);
+                section.classList.add('hidden');
+            }
+            return Promise.resolve();
+        }
+        if (pending) return pending;
+        if (loaded && !refresh) return Promise.resolve();
+        const request = ++generation;
+        abort = new AbortController();
+        pending = (async () => {
+            try {
+                const resp = await fetch('/api/plugins/nam_tone/presets', { signal: abort.signal });
+                const data = await resp.json();
+                if (disposed || request !== generation) return;
+                if (!visible()) { evict(); return; }
+                _namRenderSettingsPresetSelector(data, section, select);
+                loaded = true;
+            } catch (e) {
+                if (disposed || request !== generation) return;
+                console.warn('[NAM] Settings preset selector populate failed:', e);
+                section.classList.add('hidden');
+            } finally {
+                if (request === generation) { pending = null; abort = null; }
+            }
+        })();
+        return pending;
+    }
+
+    function reconcile() {
+        if (!select.isConnected) { controller.dispose(); return; }
+        void populate(null, false);
+    }
+
+    const observer = new MutationObserver(reconcile);
+    // Only visibility ancestors and the direct mount parent are observed;
+    // option changes and per-frame player DOM mutations cannot trigger this.
+    const observed = new Set([settings, panel, details?.parentElement].filter(Boolean));
+    for (const node of observed) {
+        observer.observe(node, {
+            attributes: node === settings || node === panel,
+            attributeFilter: node === settings || node === panel ? ['class'] : undefined,
+            childList: node === details?.parentElement,
+        });
+    }
+    details?.addEventListener('toggle', reconcile);
+    const controller = {
+        select,
+        get disposed() { return disposed; },
+        populate,
+        dispose() {
+            if (disposed) return;
+            evict();
+            disposed = true;
+            observer.disconnect();
+            details?.removeEventListener('toggle', reconcile);
+            if (_namSettingsPresetSelectorLifecycle.controller === controller) {
+                _namSettingsPresetSelectorLifecycle.controller = null;
+            }
+        },
+    };
+    _namSettingsPresetSelectorLifecycle.controller = controller;
+    return controller;
+}
+
+function _namPopulateSettingsPresetSelector(presets = null) {
+    return _namEnsureSettingsPresetSelector()?.populate(presets) || Promise.resolve();
+}
+
+function _namRenderSettingsPresetSelector(presets, section, select) {
+    presets = Array.isArray(presets) ? presets : [];
+    section.classList.toggle('hidden', presets.length === 0);
+    if (presets.length === 0) {
+        select.innerHTML = '<option value="">No presets</option>';
+        _namSettingsPresetTestId = '';
+        _namUpdateSettingsPresetTestControls();
+        return;
+    }
+
+    const current = _namSettingsPresetTestId || select.value || (_namDefaultPresetId || '');
+    const selected = presets.some(p => String(p.id) === String(current))
+        ? String(current)
+        : String(presets[0].id);
+    select.innerHTML = presets
+        .map(p => `<option value="${p.id}" ${String(p.id) === selected ? 'selected' : ''}>${esc(p.name)}</option>`)
+        .join('');
+    select.value = selected;
+    _namSettingsPresetTestId = selected;
+    _namUpdateSettingsPresetTestControls();
 }
 
 function _namUpdateStatus() {
