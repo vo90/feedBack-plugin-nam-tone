@@ -70,6 +70,84 @@ let _namSettingsPresetTestStatusHidden = false;
 const _namStorageKey = 'slopsmith_nam_tone';
 const _namNativeDeviceStorageKey = 'slopsmith-audio-device';
 
+// The shared preference suspends this owner, not the native audio device used
+// by backing and detection. Keep presets and the AMP button's desired state.
+const _namAmpSims = window.feedBack?.ampSims;
+const _namAmpWork = new Set();
+let _namToneTimer = null;
+let _namPreserveRouteOnResume = false;
+function _namAmpSnapshot() {
+    return _namAmpSims?.snapshot() || { applicable: !!window.feedBackDesktop,
+        ready: false, enabled: false, generation: 0 };
+}
+function _namAmpAllowed() {
+    const state = _namAmpSnapshot();
+    return state.applicable === false || (state.ready === true && state.enabled === true);
+}
+function _namAmpAssert(generation) {
+    if (_namAmpSnapshot().applicable === false) return;
+    if (!_namAmpAllowed() || _namAmpSnapshot().generation !== generation) {
+        throw Object.assign(new Error('In-app amp sims are disabled or this tone request expired'),
+            { code: 'amp-sims-disabled' });
+    }
+}
+function _namAmpCancelled(error) { return error?.code === 'amp-sims-disabled'; }
+function _namTrackAmpWork(operation) {
+    _namAmpWork.add(operation);
+    operation.then(() => _namAmpWork.delete(operation), () => _namAmpWork.delete(operation));
+    return operation;
+}
+function _namTrackedTask(task) {
+    return (...args) => _namTrackAmpWork(task(...args));
+}
+function _namToneAudio(api, generation = api?._namAmpGeneration ?? _namAmpSnapshot().generation) {
+    if (!api) return null;
+    const writes = new Set(['clearChain', 'loadPreset', 'setInputChannel', 'setGain', 'setNoiseGate',
+        'setMonitorMute', 'startAudio', 'stopAudio', 'setDevice', 'setDeviceType']);
+    // contextBridge freezes its public object: the facade must have its own target.
+    return new Proxy({}, { get(_target, key) {
+        if (key === '_namAmpGeneration') return generation;
+        const value = api[key];
+        if (!writes.has(key) || typeof value !== 'function') return value;
+        return (...args) => _namTrackAmpWork(Promise.resolve().then(() => {
+            _namAmpAssert(generation);
+            return value.apply(api, args);
+        }).then(result => {
+            _namAmpAssert(generation);
+            if (_namAmpCancelled(result)) throw result;
+            return result;
+        }));
+    } });
+}
+function _namStartToneTimer() {
+    if (_namToneTimer || !_namAmpAllowed()) return;
+    _namToneTimer = setInterval(_namCheckToneChange, 100);
+}
+async function _namAmpSimsChanged(state) {
+    const allowed = state.applicable === false || (state.ready && state.enabled);
+    if (!allowed) {
+        if (_namToneTimer) clearInterval(_namToneTimer);
+        _namToneTimer = null;
+        // Async fetch/load continuations carry the old generation. Let issued
+        // native calls settle before Desktop's final shared-chain clear.
+        while (_namAmpWork.size) await Promise.allSettled([..._namAmpWork]);
+        await _namTeardown({ preserveAudio: true, clearNative: false });
+        _namBuilding = false;
+        _namUpdateAmpButton();
+        return;
+    }
+    _namStartToneTimer();
+    if (_namEnabled && !_namGraphActive()) {
+        _namPreserveRouteOnResume = true;
+        try {
+            if (_namCurrentFilename) await _namLoadMappings(_namCurrentFilename);
+            await _namBuildGraph();
+            await _namApplyCurrentSongTone(true);
+        } finally { _namPreserveRouteOnResume = false; }
+    }
+    _namUpdateAmpButton();
+}
+
 function _namDesktopAudio() {
     const api = window.feedBackDesktop && window.feedBackDesktop.audio;
     if (!api || typeof api.loadPreset !== 'function' || typeof api.startAudio !== 'function') return null;
@@ -568,6 +646,7 @@ async function _namRefreshNativeLatency(api, requested = null) {
 }
 
 async function _namResetNativeAfterFailure(api) {
+    if (!_namAmpAllowed()) return;
     if (!api) return;
     try {
         if (typeof api.clearChain === 'function') await api.clearChain();
@@ -583,20 +662,27 @@ async function _namResetNativeAfterFailure(api) {
 }
 
 async function _namApplyNativePreset(preset, api) {
+    api = _namToneAudio(api);
+    const generation = api._namAmpGeneration;
+    _namAmpAssert(generation);
     _namCurrentPreset = preset;
     _namNativeMode = true;
     _namNativeReady = false;
     _namWasmReady = false;
 
-    if (preset.input_gain !== undefined) _namApplyInputGain(preset.input_gain);
-    if (preset.output_gain !== undefined) _namApplyOutputGain(preset.output_gain);
+    if (!_namPreserveRouteOnResume) {
+        if (preset.input_gain !== undefined) _namApplyInputGain(preset.input_gain);
+        if (preset.output_gain !== undefined) _namApplyOutputGain(preset.output_gain);
+    }
 
     const presetId = preset.preset_id !== undefined ? preset.preset_id : preset.id;
     if (!presetId) throw new Error('Native desktop mode requires a saved preset id');
 
     const resp = await fetch(`/api/plugins/nam_tone/native-preset/${encodeURIComponent(presetId)}`);
+    _namAmpAssert(generation);
     if (!resp.ok) throw new Error(`native preset ${presetId} failed: HTTP ${resp.status}`);
     const payload = await resp.json();
+    _namAmpAssert(generation);
     if (!payload.native_preset || !Array.isArray(payload.native_preset.chain)) {
         throw new Error('native preset response missing chain');
     }
@@ -607,26 +693,29 @@ async function _namApplyNativePreset(preset, api) {
         throw new Error(result && result.error ? result.error : 'native preset load failed');
     }
 
-    if (typeof api.setInputChannel === 'function') await api.setInputChannel(_namNativeInputChannel());
-    if (typeof api.setGain === 'function') {
-        await api.setGain('input', 1.0);
-        await api.setGain('output', 1.0);
+    if (!_namPreserveRouteOnResume) {
+        if (typeof api.setInputChannel === 'function') await api.setInputChannel(_namNativeInputChannel());
+        if (typeof api.setGain === 'function') {
+            await api.setGain('input', 1.0);
+            await api.setGain('output', 1.0);
+        }
+        if (typeof api.setNoiseGate === 'function') {
+            await api.setNoiseGate({
+                enabled: true,
+                thresholdDb: preset.gate_threshold !== undefined ? preset.gate_threshold : _namGateThreshold,
+                releaseMs: 100,
+                depthDb: -80,
+            });
+        }
+        if (typeof api.setMonitorMute === 'function') await api.setMonitorMute(false);
+        const wasRunning = typeof api.isAudioRunning === 'function'
+            ? await api.isAudioRunning().catch(() => true)
+            : true;
+        await api.startAudio();
+        _namNativeStartedAudio = !wasRunning;
     }
-    if (typeof api.setNoiseGate === 'function') {
-        await api.setNoiseGate({
-            enabled: true,
-            thresholdDb: preset.gate_threshold !== undefined ? preset.gate_threshold : _namGateThreshold,
-            releaseMs: 100,
-            depthDb: -80,
-        });
-    }
-    if (typeof api.setMonitorMute === 'function') await api.setMonitorMute(false);
-    const wasRunning = typeof api.isAudioRunning === 'function'
-        ? await api.isAudioRunning().catch(() => true)
-        : true;
-    await api.startAudio();
-    _namNativeStartedAudio = !wasRunning;
     await _namRefreshNativeLatency(api);
+    _namAmpAssert(generation);
 
     _namNativeReady = true;
     console.log('[NAM] Applied native desktop preset:', payload.name || preset.name || preset.preset_name,
@@ -635,17 +724,22 @@ async function _namApplyNativePreset(preset, api) {
 }
 
 async function _namBuildNativeGraph(api) {
+    api = _namToneAudio(api);
+    const generation = api._namAmpGeneration;
+    _namAmpAssert(generation);
     _namBuilding = true;
     _namNativeMode = true;
     let loadedPreset = false;
     try {
-        await _namApplySavedNativeDevice(api);
+        if (!_namPreserveRouteOnResume) await _namApplySavedNativeDevice(api);
+        _namAmpAssert(generation);
         if (_namCurrentPreset) {
             await _namApplyNativePreset(_namCurrentPreset, api);
             loadedPreset = true;
         } else if (_namDefaultPresetId) {
             const resp = await fetch('/api/plugins/nam_tone/presets');
             const presets = await resp.json();
+            _namAmpAssert(generation);
             const def = presets.find(p => p.id === _namDefaultPresetId);
             if (def) {
                 await _namApplyNativePreset(def, api);
@@ -653,7 +747,7 @@ async function _namBuildNativeGraph(api) {
             }
         } else {
             await api.clearChain();
-            if (typeof api.setMonitorMute === 'function') await api.setMonitorMute(true);
+            if (!_namPreserveRouteOnResume && typeof api.setMonitorMute === 'function') await api.setMonitorMute(true);
         }
         if (!loadedPreset) {
             await _namRefreshNativeLatency(api);
@@ -729,21 +823,28 @@ if (window.slopsmith && window.slopsmith.audio) {
 // ── Audio Graph ────────────────────────────────────────────────────────────
 
 async function _namBuildGraph() {
-    const nativeApi = _namDesktopAudio();
+    const generation = _namAmpSnapshot().generation;
+    _namAmpAssert(generation);
+    const nativeApi = _namToneAudio(_namDesktopAudio(), generation);
     if (await _namShouldUseNativeAudio(nativeApi)) {
+        _namAmpAssert(generation);
         try {
             await _namBuildNativeGraph(nativeApi);
             return;
         } catch (e) {
+            if (_namAmpCancelled(e)) throw e;
             console.warn('[NAM] Native desktop graph failed; falling back to browser WASM:', e);
             await _namResetNativeAfterFailure(nativeApi);
         }
     }
 
+    _namAmpAssert(generation);
     await _namBuildWasmGraph();
 }
 
 async function _namBuildWasmGraph() {
+    const generation = _namAmpSnapshot().generation;
+    _namAmpAssert(generation);
     _namNativeMode = false;
     _namNativeReady = false;
     _namNativeLatencyText = null;
@@ -753,6 +854,7 @@ async function _namBuildWasmGraph() {
         _namCtx = new (window.AudioContext || window.webkitAudioContext)();
     }
     if (_namCtx.state === 'suspended') await _namCtx.resume();
+    _namAmpAssert(generation);
 
     // getUserMedia — raw signal, no processing
     const constraints = {
@@ -768,6 +870,7 @@ async function _namBuildWasmGraph() {
     }
 
     _namStream = await navigator.mediaDevices.getUserMedia(constraints);
+    _namAmpAssert(generation);
     _namSource = _namCtx.createMediaStreamSource(_namStream);
     const streamChannels = _namSource.channelCount;
 
@@ -790,6 +893,7 @@ async function _namBuildWasmGraph() {
     // Load AudioWorklet module (first time only)
     if (!_namWorkletReady) {
         await _namCtx.audioWorklet.addModule('/api/plugins/nam_tone/worklet/nam-processor.js');
+        _namAmpAssert(generation);
         _namWorkletReady = true;
     }
 
@@ -826,6 +930,7 @@ async function _namBuildWasmGraph() {
 
         // Load WASM into worklet (once)
         await _namSendWasm();
+        _namAmpAssert(generation);
     } else {
         // Reusing existing node — disconnect old inputs
         try { _namWorkletNode.disconnect(); } catch (_) {}
@@ -865,6 +970,7 @@ async function _namBuildWasmGraph() {
         try {
             const resp = await fetch('/api/plugins/nam_tone/presets');
             const presets = await resp.json();
+            _namAmpAssert(generation);
             const def = presets.find(p => p.id === _namDefaultPresetId);
             if (def) await _namApplyWasmPreset(def);
         } catch (e) { /* ignore */ }
@@ -885,6 +991,8 @@ async function _namBuildWasmGraph() {
 // ── WASM Loading ───────────────────────────────────────────────────────────
 
 async function _namSendWasm() {
+    const generation = _namAmpSnapshot().generation;
+    _namAmpAssert(generation);
     if (_namWasmReady) return; // already loaded
     try {
         const [wasmResp, jsResp] = await Promise.all([
@@ -899,6 +1007,7 @@ async function _namSendWasm() {
 
         const wasmBinary = await wasmResp.arrayBuffer();
         const glueCode = await jsResp.text();
+        _namAmpAssert(generation);
 
         _namWorkletNode.port.postMessage(
             { type: 'load-wasm', wasmBinary, glueCode },
@@ -912,6 +1021,8 @@ async function _namSendWasm() {
 // ── Model Loading ──────────────────────────────────────────────────────────
 
 async function _namLoadModel(modelFile) {
+    const generation = _namAmpSnapshot().generation;
+    _namAmpAssert(generation);
     if (!_namWorkletNode || !_namWasmReady) return;
 
     // Check cache
@@ -923,12 +1034,15 @@ async function _namLoadModel(modelFile) {
         _namModelCache[modelFile] = modelJson;
     }
 
+    _namAmpAssert(generation);
     _namWorkletNode.port.postMessage({ type: 'load-model', modelJson });
 }
 
 // ── IR Loading ─────────────────────────────────────────────────────────────
 
 async function _namLoadIR(irFile) {
+    const generation = _namAmpSnapshot().generation;
+    _namAmpAssert(generation);
     if (!_namCtx || !_namConvolver) return;
 
     // Check cache
@@ -947,6 +1061,7 @@ async function _namLoadIR(irFile) {
         _namIrCache[irFile] = audioBuf;
     }
 
+    _namAmpAssert(generation);
     _namConvolver.buffer = audioBuf;
 
     // Switch from bypass to convolver path
@@ -966,12 +1081,16 @@ function _namBypassIR() {
 // ── Preset Application ────────────────────────────────────────────────────
 
 async function _namApplyPreset(preset) {
-    const nativeApi = _namDesktopAudio();
+    const generation = _namAmpSnapshot().generation;
+    _namAmpAssert(generation);
+    const nativeApi = _namToneAudio(_namDesktopAudio(), generation);
     if (await _namShouldUseNativeAudio(nativeApi)) {
+        _namAmpAssert(generation);
         try {
             await _namApplyNativePreset(preset, nativeApi);
             return;
         } catch (e) {
+            if (_namAmpCancelled(e)) throw e;
             console.warn('[NAM] Native preset apply failed; falling back to browser WASM:', e);
             await _namResetNativeAfterFailure(nativeApi);
             if (!_namGraphActive()) {
@@ -981,10 +1100,13 @@ async function _namApplyPreset(preset) {
         }
     }
 
+    _namAmpAssert(generation);
     await _namApplyWasmPreset(preset);
 }
 
 async function _namApplyWasmPreset(preset) {
+    const generation = _namAmpSnapshot().generation;
+    _namAmpAssert(generation);
     _namCurrentPreset = preset;
 
     // Apply gains without persisting to localStorage — preset gains are
@@ -1003,6 +1125,7 @@ async function _namApplyWasmPreset(preset) {
     // Load model
     if (preset.model_file) {
         await _namLoadModel(preset.model_file);
+        _namAmpAssert(generation);
     }
 
     // Load IR (or bypass)
@@ -1019,11 +1142,14 @@ async function _namApplyWasmPreset(preset) {
 
 async function _namLoadMappings(filename) {
     _namCurrentFilename = filename;
+    if (!_namAmpAllowed()) return;
+    const generation = _namAmpSnapshot().generation;
     _namMappings = {};
     _namCurrentTone = null;
     try {
         const resp = await fetch(`/api/plugins/nam_tone/mappings/${encodeURIComponent(decodeURIComponent(filename))}`);
         const data = await resp.json();
+        _namAmpAssert(generation);
         for (const m of data) {
             _namMappings[m.tone_key] = m;
         }
@@ -1119,6 +1245,7 @@ function _namFallbackMappingForCurrentSong() {
 }
 
 async function _namApplyCurrentSongTone(force = false) {
+    if (!_namAmpAllowed()) return false;
     if (!_namEnabled || !_namCurrentFilename || _namBuilding || _namToneApplyPending) return false;
     if (!_namReadyForToneApply() || Object.keys(_namMappings).length === 0) return false;
 
@@ -1147,13 +1274,14 @@ async function _namApplyCurrentSongTone(force = false) {
 }
 
 async function _namEnsureNativeAlive() {
+    if (!_namAmpAllowed()) return;
     if (!_namEnabled || !_namNativeMode || !_namNativeReady || !_namCurrentPreset || _namNativeRecoverPending) return;
 
     const now = Date.now();
     if (now - _namLastNativeRecoverAt < 1500) return;
     _namLastNativeRecoverAt = now;
 
-    const api = _namDesktopAudio();
+    const api = _namToneAudio(_namDesktopAudio());
     if (!api) return;
 
     _namNativeRecoverPending = true;
@@ -1192,6 +1320,7 @@ async function _namEnsureNativeAlive() {
 }
 
 function _namCheckToneChange() {
+    if (!_namAmpAllowed()) return;
     if (!_namEnabled || !_namCurrentFilename || _namBuilding) return;
     if ((_namNativeMode ? !_namNativeReady : !_namWasmReady) || Object.keys(_namMappings).length === 0) return;
 
@@ -1199,13 +1328,14 @@ function _namCheckToneChange() {
     _namApplyCurrentSongTone(false);
 }
 
-setInterval(_namCheckToneChange, 100);
+// Started/stopped by the shared preference subscription below.
 
 // ── Guitar Stem Ducking ────────────────────────────────────────────────────
 
 let _namDuckedStems = [];
 
 function _namDuckGuitarStem() {
+    if (!_namAmpAllowed()) return;
     if (!_namDuckGuitar || !_namEnabled) return;
     const stems = window._stemsState;
     if (!stems) return;
@@ -1279,15 +1409,18 @@ function _namRestoreGuitarStem() {
 
 // ── Teardown ───────────────────────────────────────────────────────────────
 
-async function _namTeardown() {
+async function _namTeardown({ preserveAudio = false, clearNative = true } = {}) {
+    if (!_namAmpAllowed()) { preserveAudio = true; clearNative = false; }
     if (_namNativeMode) {
-        const api = _namDesktopAudio();
+        // An ordinary AMP-off teardown may already be awaiting clearChain
+        // when global OFF arrives. Fence every later shared-device write too.
+        const api = _namToneAudio(_namDesktopAudio());
         if (api) {
-            await Promise.resolve(api.clearChain()).catch(e => console.warn('[NAM] Native clear failed:', e));
-            if (_namNativeStartedAudio && typeof api.stopAudio === 'function') {
+            if (clearNative) await Promise.resolve(api.clearChain()).catch(e => console.warn('[NAM] Native clear failed:', e));
+            if (!preserveAudio && _namNativeStartedAudio && typeof api.stopAudio === 'function') {
                 await Promise.resolve(api.stopAudio()).catch(e => console.warn('[NAM] Native stop failed:', e));
             }
-            if (typeof api.setMonitorMute === 'function') {
+            if (!preserveAudio && typeof api.setMonitorMute === 'function') {
                 await Promise.resolve(api.setMonitorMute(true)).catch(() => {});
             }
         }
@@ -1309,6 +1442,7 @@ async function _namTeardown() {
     if (_namBypassGain) { try { _namBypassGain.disconnect(); } catch (_) {} _namBypassGain = null; }
     if (_namOutputGain) { try { _namOutputGain.disconnect(); } catch (_) {} _namOutputGain = null; }
     // Keep _namCtx and _namWorkletNode alive for reuse
+    if (_namCtx?.state === 'running') await _namCtx.suspend();
     _namRestoreGuitarStem();
 }
 
@@ -1330,6 +1464,7 @@ function _namInjectButton() {
 }
 
 async function _namToggle() {
+    if (!_namAmpAllowed()) return;
     _namEnabled = !_namEnabled;
     if (!_namEnabled) {
         if (_namTestBackup) {
@@ -1345,6 +1480,7 @@ async function _namToggle() {
             await _namApplyCurrentSongTone(true);
             _namDuckGuitarStem();
         }).catch(e => {
+            if (_namAmpCancelled(e)) return;
             _namBuilding = false;
             _namEnabled = false;
             _namRestoreGuitarStem();
@@ -1409,6 +1545,8 @@ function _namGraphActive() {
 function _namUpdateAmpButton() {
     const btn = document.getElementById('btn-nam');
     if (!btn) return;
+    btn.disabled = !_namAmpAllowed();
+    btn.title = btn.disabled ? 'Enable in-app amp sims in Audio settings to use NAM tones' : 'Toggle NAM amp modeling';
     btn.className = _namEnabled
         ? 'px-3 py-1.5 bg-green-700/40 hover:bg-green-700/60 rounded-lg text-xs text-green-300 transition'
         : 'px-3 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-400 transition';
@@ -1806,8 +1944,11 @@ window.namDeletePreset = async function(presetId) {
 };
 
 window.namStartPresetTest = async function(presetId) {
+    if (!_namAmpAllowed()) return;
+    const generation = _namAmpSnapshot().generation;
     if (!presetId) return;
     const preset = await _namGetPresetById(presetId);
+    if (!_namAmpAllowed() || _namAmpSnapshot().generation !== generation) return;
     if (!preset) {
         console.warn('[NAM] Preset not found for test:', presetId);
         return;
@@ -1835,6 +1976,7 @@ window.namStartPresetTest = async function(presetId) {
         _namUpdateStatus();
         _namUpdateSettingsPresetTestStatus();
     } catch (e) {
+        if (_namAmpCancelled(e)) return;
         console.error('[NAM] Preset tone test failed:', e);
         _namTestMode = false;
         _namTestPresetId = null;
@@ -2064,6 +2206,7 @@ async function _namRebuildBrowserWasmPath() {
         _namUpdateStatus();
         _namUpdateSettingsPresetTestStatus();
     } catch (e) {
+        if (_namAmpCancelled(e)) return;
         console.error('[NAM] Browser input rebuild failed:', e);
         _namBuilding = false;
         _namEnabled = false;
@@ -2099,6 +2242,7 @@ window.namSetEngineMode = async function(mode) {
     });
 
     _namRebuildActiveGraphForEngineChange().catch(e => {
+        if (_namAmpCancelled(e)) return;
         console.error('[NAM] Engine switch failed:', e);
         _namBuilding = false;
         _namEnabled = false;
@@ -2371,5 +2515,20 @@ window.namPopulatePresetDropdowns = async function() {
             irs.map(m => `<option value="${esc(m.name)}" ${m.name === cur ? 'selected' : ''}>${esc(m.name)}</option>`).join('');
     }
 };
+
+// Track complete async owners as well as issued native calls. OFF can then
+// wait for late network/model responses to exit before the shared final clear.
+_namBuildGraph = _namTrackedTask(_namBuildGraph);
+_namBuildWasmGraph = _namTrackedTask(_namBuildWasmGraph);
+_namApplyPreset = _namTrackedTask(_namApplyPreset);
+_namApplyWasmPreset = _namTrackedTask(_namApplyWasmPreset);
+_namApplyCurrentSongTone = _namTrackedTask(_namApplyCurrentSongTone);
+_namEnsureNativeAlive = _namTrackedTask(_namEnsureNativeAlive);
+_namTeardown = _namTrackedTask(_namTeardown);
+_namRebuildActiveGraphForEngineChange = _namTrackedTask(_namRebuildActiveGraphForEngineChange);
+_namRebuildBrowserWasmPath = _namTrackedTask(_namRebuildBrowserWasmPath);
+_namRestoreTestBackup = _namTrackedTask(_namRestoreTestBackup);
+_namAmpSims?.subscribe(_namAmpSimsChanged);
+_namStartToneTimer();
 
 })();
