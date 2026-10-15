@@ -21,7 +21,8 @@ let _namStream = null;        // MediaStream from getUserMedia
 let _namSource = null;        // MediaStreamSourceNode
 let _namWorkletNode = null;   // AudioWorkletNode running NAM
 let _namConvolver = null;     // ConvolverNode for cabinet IR
-let _namInputGain = null;     // GainNode — input sensitivity
+let _namInputGain = null;     // GainNode — tone/preset drive
+let _namCalibrationGain = null; // GainNode — selected guitar calibration, browser path only
 let _namOutputGain = null;    // GainNode — master volume
 let _namBypassGain = null;    // GainNode — IR bypass routing
 
@@ -69,6 +70,50 @@ let _namSettingsPresetTestStatusHidden = false;
 
 const _namStorageKey = 'slopsmith_nam_tone';
 const _namNativeDeviceStorageKey = 'slopsmith-audio-device';
+
+function _namGuitarCalibrationMatches(snapshot) {
+    const route = snapshot?.route;
+    const device = id => !id || id === 'default' ? '' : id;
+    return route?.kind === 'browser'
+        && device(route.deviceId) === device(_namDeviceId)
+        && route.channel === _namNativeInputChannel();
+}
+
+function _namGuitarCalibration() {
+    const snapshot = window.feedBack?.guitarProfiles?.getSnapshot();
+    if (!_namGuitarCalibrationMatches(snapshot)) return 1.0;
+    const gain = Number(snapshot.gain);
+    return Number.isFinite(gain) && gain > 0 ? gain : 1.0;
+}
+
+function _namUpdateGuitarCalibration() {
+    // Native input calibration belongs to Desktop's dedicated stage. The
+    // browser graph has its own raw capture, so it needs one separate stage.
+    if (_namCalibrationGain) {
+        const gain = _namGuitarCalibration();
+        if (_namCalibrationGain.gain.setTargetAtTime && _namCtx) {
+            _namCalibrationGain.gain.setTargetAtTime(gain, _namCtx.currentTime, 0.01);
+        } else {
+            _namCalibrationGain.gain.value = gain;
+        }
+    }
+    const status = document.getElementById('nam-guitar-calibration-status');
+    if (status) {
+        const snapshot = window.feedBack?.guitarProfiles?.getSnapshot();
+        const browser = !_namNativeMode && (_namEngineMode === 'wasm' || !!_namCalibrationGain);
+        status.textContent = !snapshot ? '' : browser && !_namGuitarCalibrationMatches(snapshot)
+            ? 'Guitar calibration is not applied here: select the same browser input and channel as detection.'
+            : `Guitar calibration: ${snapshot.activeName || 'Default guitar'}. Tone gain is saved separately.`;
+    }
+}
+
+const _namGuitarProfiles = window.feedBack?.guitarProfiles;
+if (_namGuitarProfiles) {
+    _namGuitarProfiles.subscribe(_namUpdateGuitarCalibration);
+    Promise.resolve(_namGuitarProfiles.ready).then(_namUpdateGuitarCalibration).catch(error => {
+        console.warn('[NAM] Guitar profiles could not be loaded:', error);
+    });
+}
 
 // The shared preference suspends this owner, not the native audio device used
 // by backing and detection. Keep presets and the AMP button's desired state.
@@ -845,6 +890,9 @@ async function _namBuildGraph() {
 async function _namBuildWasmGraph() {
     const generation = _namAmpSnapshot().generation;
     _namAmpAssert(generation);
+    // refresh also recovers an earlier startup failure; ready is one-shot.
+    if (_namGuitarProfiles) await _namGuitarProfiles.refresh();
+    _namAmpAssert(generation);
     _namNativeMode = false;
     _namNativeReady = false;
     _namNativeLatencyText = null;
@@ -874,9 +922,13 @@ async function _namBuildWasmGraph() {
     _namSource = _namCtx.createMediaStreamSource(_namStream);
     const streamChannels = _namSource.channelCount;
 
-    // Input gain
+    // Guitar calibration is separate from the tone's input drive. Preset
+    // changes only replace _namInputGainVal, never the selected guitar's trim.
+    _namCalibrationGain = _namCtx.createGain();
+    _namCalibrationGain.gain.value = _namGuitarCalibration();
     _namInputGain = _namCtx.createGain();
     _namInputGain.gain.value = _namInputGainVal;
+    _namCalibrationGain.connect(_namInputGain);
 
     // Channel routing (note_detect pattern)
     if (streamChannels >= 2 && _namChannel !== 'mono') {
@@ -885,9 +937,9 @@ async function _namBuildWasmGraph() {
         const merger = _namCtx.createChannelMerger(1);
         const chIdx = _namChannel === 'left' ? 0 : 1;
         splitter.connect(merger, chIdx, 0);
-        merger.connect(_namInputGain);
+        merger.connect(_namCalibrationGain);
     } else {
-        _namSource.connect(_namInputGain);
+        _namSource.connect(_namCalibrationGain);
     }
 
     // Load AudioWorklet module (first time only)
@@ -954,7 +1006,7 @@ async function _namBuildWasmGraph() {
     _namBypassGain = _namCtx.createGain();
     _namBypassGain.gain.value = 1.0;
 
-    // Wire chain: inputGain → worklet → (convolver | bypass) → outputGain → destination
+    // Wire chain: guitar calibration → tone drive → worklet → cab → output.
     _namInputGain.connect(_namWorkletNode);
 
     // Default: bypass convolver (direct path)
@@ -985,6 +1037,7 @@ async function _namBuildWasmGraph() {
 
     console.log('[NAM] Audio graph built, latency:',
         Math.round((_namCtx.baseLatency + _namCtx.outputLatency) * 1000), 'ms');
+    _namUpdateGuitarCalibration();
     _namUpdateStatus();
 }
 
@@ -1436,6 +1489,7 @@ async function _namTeardown({ preserveAudio = false, clearNative = true } = {}) 
         _namStream = null;
     }
     if (_namSource) { try { _namSource.disconnect(); } catch (_) {} _namSource = null; }
+    if (_namCalibrationGain) { try { _namCalibrationGain.disconnect(); } catch (_) {} _namCalibrationGain = null; }
     if (_namInputGain) { try { _namInputGain.disconnect(); } catch (_) {} _namInputGain = null; }
     if (_namWorkletNode) { try { _namWorkletNode.disconnect(); } catch (_) {} }
     if (_namConvolver) { try { _namConvolver.disconnect(); } catch (_) {} _namConvolver = null; }
@@ -2143,6 +2197,7 @@ function _namApplyOutputGain(val) {
 function _namInitSettingsControls() {
     _namApplyInputGain(_namInputGainVal);
     _namApplyOutputGain(_namOutputGainVal);
+    _namUpdateGuitarCalibration();
 
     const browserDevice = document.getElementById('nam-device-select');
     if (browserDevice) browserDevice.value = _namDeviceId;
@@ -2231,6 +2286,7 @@ window.namSetEngineMode = async function(mode) {
     await _namStopSettingsPresetTestForSettingChange();
     _namEngineMode = next;
     _namSaveSettings();
+    _namUpdateGuitarCalibration();
 
     _namUpdateEngineModeVisibility(_namSupportsNativeDeviceSettings(_namDesktopAudio()));
     if (_namEngineMode === 'native') window.namPopulateNativeDevices().catch(e => {
@@ -2414,6 +2470,7 @@ window.namSelectDevice = async function(deviceId) {
     await _namStopSettingsPresetTestForSettingChange();
     _namDeviceId = deviceId;
     _namSaveSettings();
+    _namUpdateGuitarCalibration();
     await _namRebuildBrowserWasmPath();
 };
 
@@ -2421,6 +2478,7 @@ window.namSelectChannel = async function(channel) {
     await _namStopSettingsPresetTestForSettingChange();
     _namChannel = channel;
     _namSaveSettings();
+    _namUpdateGuitarCalibration();
     await _namRebuildBrowserWasmPath();
     _namUpdateNativeApplyButtonState();
 };

@@ -95,11 +95,12 @@
 
     <div class="mt-4 border-t border-gray-800 pt-3">
         <label for="nam-input-gain-slider" class="text-xs font-medium text-gray-400 mb-1 block">
-            Input Gain: <span id="nam-input-gain-label">1.0</span>
+            Tone Input Gain: <span id="nam-input-gain-label">1.0</span>
         </label>
         <input type="range" id="nam-input-gain-slider" min="0" max="10" step="0.1" value="1.0"
             oninput="namSetInputGain(this.value)"
             class="w-full accent-accent">
+        <p id="nam-guitar-calibration-status" class="text-[10px] text-gray-500 mt-1" aria-live="polite"></p>
     </div>
 
     <div class="mt-3">
