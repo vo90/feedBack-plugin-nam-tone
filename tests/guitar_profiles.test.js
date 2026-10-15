@@ -6,7 +6,7 @@ const vm = require('node:vm');
 const source = fs.readFileSync(path.join(__dirname, '..', 'screen.js'), 'utf8');
 
 function setup({profile = true, enabled = true} = {}) {
-    let snapshot = {activeId: 'default', activeName: 'Default guitar', gain: 2,
+    let snapshot = {activeId: 'default', activeName: 'Default guitar', gain: 2, applied: true,
         route: {kind: 'browser', deviceId: '', channel: -1}};
     const listeners = [], nativeWrites = [], nodes = [];
     const label = {};
@@ -56,9 +56,11 @@ function setup({profile = true, enabled = true} = {}) {
         _namLoadIR = async () => {};
         window.testNam = {build: _namBuildWasmGraph, apply: _namApplyWasmPreset,
             native: _namApplyNativePreset, teardown: _namTeardown,
+            applyDevice: _namApplyNativeDeviceSettings, keepalive: _namEnsureNativeAlive,
             update: _namUpdateGuitarCalibration,
             state: () => ({calibration: _namCalibrationGain, tone: _namInputGain,
-                source: _namSource, worklet: _namWorkletNode}),
+                source: _namSource, worklet: _namWorkletNode, nativeReady: _namNativeReady}),
+            activateNative() {_namEnabled = true; _namNativeMode = true; _namNativeReady = true; _namCurrentPreset = {id: 1};},
             input(device, channel) {_namDeviceId = device; _namChannel = channel;}};
     `;
     vm.runInContext(source.slice(0, exportAt) + exports + source.slice(exportAt), context);
@@ -122,6 +124,81 @@ test('native preset replacement never writes or resets guitar calibration', asyn
     assert.equal(s.profiles.getSnapshot().gain, 2);
     assert.deepEqual(s.nativeWrites, ['clear', 'preset', ['input', 1], ['output', 1],
         'clear', 'preset', ['input', 1], ['output', 1]]);
+});
+
+test('native preset startup waits for route calibration before unmuting or reporting ready', async () => {
+    const s = setup(); s.change({route: {kind: 'native'}});
+    const events = [];
+    let release, reached;
+    const pending = new Promise(resolve => {release = resolve;});
+    const entered = new Promise(resolve => {reached = resolve;});
+    s.api.setInputChannel = async () => {events.push('channel');};
+    s.api.startAudio = async () => {events.push('start');};
+    s.api.setMonitorMute = async muted => {events.push(muted ? 'mute' : 'unmute');};
+    s.profiles.refresh = async () => {events.push('refresh'); reached(); await pending; return s.profiles.getSnapshot();};
+    const load = s.test.native({id: 1}, s.api);
+    await entered;
+    assert.deepEqual(events, ['mute', 'channel', 'start', 'refresh']);
+    assert.equal(s.test.state().nativeReady, false);
+    release(); await load;
+    assert.equal(events.at(-1), 'unmute');
+    assert.equal(s.test.state().nativeReady, true);
+});
+
+test('failed route calibration keeps native monitoring muted and unready', async () => {
+    const s = setup(); s.change({route: {kind: 'native'}});
+    const mute = [];
+    s.api.setMonitorMute = async value => {mute.push(value);};
+    s.profiles.refresh = async () => {throw new Error('Input calibration unavailable');};
+    await assert.rejects(s.test.native({id: 1}, s.api), /calibration unavailable/);
+    assert.deepEqual(mute, [true]);
+    assert.equal(s.test.state().nativeReady, false);
+});
+
+test('native device reopen recalls route calibration before restoring monitoring', async () => {
+    const s = setup(); s.change({route: {kind: 'native'}});
+    const events = [];
+    Object.assign(s.api, {
+        getDeviceTypes() {}, getSampleRates() {}, getBufferSizes() {}, setDeviceType() {},
+        async getCurrentDevice() {return {type: 'ASIO', input: 'Old input', output: 'Speakers', sampleRate: 48000, blockSize: 256};},
+        async isMonitorMuted() {return false;},
+        async setMonitorMute(muted) {events.push(muted ? 'mute' : 'unmute');},
+        async stopAudio() {events.push('stop');},
+        async setDevice() {events.push('device'); return true;},
+        async startAudio() {events.push('start');},
+    });
+    s.profiles.refresh = async () => {events.push('refresh'); return s.profiles.getSnapshot();};
+    assert.equal(await s.test.applyDevice(s.api, {type: 'ASIO', input: 'New input', output: 'Speakers', sampleRate: 48000, bufferSize: 256}, true), true);
+    assert.deepEqual(events, ['mute', 'stop', 'device', 'start', 'refresh', 'unmute']);
+});
+
+test('native keepalive refreshes route gain after restart and before unmute', async () => {
+    const s = setup(); s.change({route: {kind: 'native'}});
+    const events = []; let muted = false;
+    Object.assign(s.api, {
+        async isAudioRunning() {return false;},
+        async isMonitorMuted() {return muted;},
+        async setMonitorMute(value) {muted = value; events.push(value ? 'mute' : 'unmute');},
+        async startAudio() {events.push('start');},
+    });
+    s.context.feedBackDesktop = {audio: s.api};
+    s.profiles.refresh = async () => {events.push('refresh'); return s.profiles.getSnapshot();};
+    s.test.activateNative();
+    await s.test.keepalive();
+    assert.equal(events[0], 'mute');
+    assert.ok(events.indexOf('start') < events.indexOf('refresh'));
+    assert.equal(events.at(-1), 'unmute');
+});
+
+test('browser startup refreshes calibration again after capture permission resolves', async () => {
+    const s = setup(); let calls = 0;
+    s.profiles.refresh = async () => {
+        if (++calls === 2) s.change({gain: 4});
+        return s.profiles.getSnapshot();
+    };
+    await s.test.build();
+    assert.equal(calls, 2);
+    assert.equal(s.test.state().calibration.gain.value, 4);
 });
 
 test('external mode accepts profile changes without starting or changing tones', async () => {

@@ -115,6 +115,14 @@ if (_namGuitarProfiles) {
     });
 }
 
+async function _namRefreshNativeGuitarCalibration() {
+    if (!_namGuitarProfiles) return;
+    const snapshot = await _namGuitarProfiles.refresh();
+    if (snapshot.route?.kind !== 'native' || !snapshot.applied) {
+        throw new Error('Start and select the audio input before enabling guitar monitoring.');
+    }
+}
+
 // The shared preference suspends this owner, not the native audio device used
 // by backing and detection. Keep presets and the AMP button's desired state.
 const _namAmpSims = window.feedBack?.ampSims;
@@ -492,6 +500,9 @@ async function _namApplyNativeDeviceSettings(api, settings, restartWhenActive) {
     const wasRunning = typeof api.isAudioRunning === 'function'
         ? await api.isAudioRunning().catch(() => false)
         : false;
+    const restoreMonitor = _namGuitarProfiles && typeof api.isMonitorMuted === 'function'
+        ? !await api.isMonitorMuted().catch(() => true) : false;
+    if (_namGuitarProfiles && typeof api.setMonitorMute === 'function') await api.setMonitorMute(true);
     if (wasRunning && typeof api.stopAudio === 'function') await api.stopAudio();
     if (type && (!current || type !== current.type)) await api.setDeviceType(type);
     const ok = await api.setDevice(input, output, sampleRate, bufferSize);
@@ -499,6 +510,8 @@ async function _namApplyNativeDeviceSettings(api, settings, restartWhenActive) {
     if ((wasRunning || restartWhenActive) && typeof api.startAudio === 'function') {
         await api.startAudio();
         if (!wasRunning && restartWhenActive) _namNativeStartedAudio = true;
+        await _namRefreshNativeGuitarCalibration();
+        if (restoreMonitor && typeof api.setMonitorMute === 'function') await api.setMonitorMute(false);
     }
     return true;
 }
@@ -732,6 +745,9 @@ async function _namApplyNativePreset(preset, api) {
         throw new Error('native preset response missing chain');
     }
 
+    if (_namGuitarProfiles && !_namPreserveRouteOnResume && typeof api.setMonitorMute === 'function') {
+        await api.setMonitorMute(true);
+    }
     await api.clearChain();
     const result = await api.loadPreset(JSON.stringify(payload.native_preset));
     if (!result || result.success === false) {
@@ -752,13 +768,17 @@ async function _namApplyNativePreset(preset, api) {
                 depthDb: -80,
             });
         }
-        if (typeof api.setMonitorMute === 'function') await api.setMonitorMute(false);
         const wasRunning = typeof api.isAudioRunning === 'function'
             ? await api.isAudioRunning().catch(() => true)
             : true;
         await api.startAudio();
         _namNativeStartedAudio = !wasRunning;
     }
+    // Channel selection and reopening can change the physical input route.
+    // Recall its guitar gain before unmuting or reporting the preset ready.
+    await _namRefreshNativeGuitarCalibration();
+    _namAmpAssert(generation);
+    if (!_namPreserveRouteOnResume && typeof api.setMonitorMute === 'function') await api.setMonitorMute(false);
     await _namRefreshNativeLatency(api);
     _namAmpAssert(generation);
 
@@ -918,6 +938,9 @@ async function _namBuildWasmGraph() {
     }
 
     _namStream = await navigator.mediaDevices.getUserMedia(constraints);
+    _namAmpAssert(generation);
+    // The input may have changed while permission/capture startup was pending.
+    if (_namGuitarProfiles) await _namGuitarProfiles.refresh();
     _namAmpAssert(generation);
     _namSource = _namCtx.createMediaStreamSource(_namStream);
     const streamChannels = _namSource.channelCount;
@@ -1343,14 +1366,17 @@ async function _namEnsureNativeAlive() {
         if (typeof api.isAudioRunning === 'function') {
             const running = await api.isAudioRunning().catch(() => true);
             if (!running) {
+                if (_namGuitarProfiles && typeof api.setMonitorMute === 'function') await api.setMonitorMute(true);
                 await api.startAudio();
                 _namNativeStartedAudio = true;
+                await _namRefreshNativeGuitarCalibration();
                 recovered = true;
             }
         }
         if (typeof api.isMonitorMuted === 'function') {
             const muted = await api.isMonitorMuted().catch(() => false);
             if (muted && typeof api.setMonitorMute === 'function') {
+                await _namRefreshNativeGuitarCalibration();
                 await api.setMonitorMute(false);
                 recovered = true;
             }
@@ -2438,6 +2464,9 @@ window.namApplyNativeDevice = async function() {
     _namSetNativeDeviceBusy(true);
     _namSetNativeDeviceStatus('Applying...');
     try {
+        const restoreMonitor = _namGuitarProfiles && typeof api.isMonitorMuted === 'function'
+            ? !await api.isMonitorMuted().catch(() => true) : false;
+        if (_namGuitarProfiles && typeof api.setMonitorMute === 'function') await api.setMonitorMute(true);
         const settings = _namNativeDeviceFormValues();
         const ok = await _namApplyNativeDeviceSettings(api, settings, _namEnabled && _namNativeMode);
         if (!ok) {
@@ -2445,6 +2474,15 @@ window.namApplyNativeDevice = async function() {
             return;
         }
         if (typeof api.setInputChannel === 'function') await api.setInputChannel(_namNativeInputChannel());
+        if (_namGuitarProfiles) {
+            const running = typeof api.isAudioRunning === 'function' && await api.isAudioRunning();
+            if (running) {
+                await _namRefreshNativeGuitarCalibration();
+                if (restoreMonitor && typeof api.setMonitorMute === 'function') await api.setMonitorMute(false);
+            } else {
+                await _namGuitarProfiles.refresh();
+            }
+        }
         const actualDevice = await api.getCurrentDevice().catch(() => null);
         _namRememberAcceptedNativeBuffer(settings, actualDevice);
         const actual = await _namRefreshNativeDeviceTimingControls(api, actualDevice, settings, false, false, true);
